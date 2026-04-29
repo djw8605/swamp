@@ -16,6 +16,11 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// maxContinuations is the upper bound on how many times runOpenCodeProcess
+// will re-invoke opencode after a step_finish with reason="length".
+// This prevents a broken loop from running indefinitely.
+const maxContinuations = 10
+
 // outputBroadcaster is a minimal interface for sending output to connected
 // WebSocket clients. Satisfied by *ws.Hub (server-side) and workerStreamerHub
 // (inside K8s pods / detached processes).
@@ -33,6 +38,60 @@ func resetOpenCodeState(workDir string) {
 			log.Warn().Err(err).Str("dir", dir).Msg("Failed to remove opencode state dir")
 		}
 	}
+}
+
+// openCodeRunResult holds the machine-readable metadata aggregated from one
+// opencode invocation's JSON event stream.
+type openCodeRunResult struct {
+	SessionID  string // last seen session ID from the event stream
+	StepReason string // finish reason from the last step_finish event
+	HasWork    bool   // true when at least one text or tool_use event was seen
+}
+
+// parseOpenCodeEventMeta extracts machine-readable metadata from a single
+// JSON event line emitted by opencode --format json.
+//
+// It returns:
+//   - sessionID: the session identifier carried by the event (may be empty)
+//   - stepReason: the finish reason if this is a step_finish event (may be empty)
+//   - isWork: true when the event represents useful agent activity
+func parseOpenCodeEventMeta(line []byte) (sessionID, stepReason string, isWork bool) {
+	if len(line) == 0 || line[0] != '{' {
+		return
+	}
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(line, &raw) != nil {
+		return
+	}
+
+	// Extract sessionId from any event that carries it (try common field names).
+	for _, key := range []string{"sessionId", "session_id"} {
+		if sid, ok := raw[key]; ok {
+			var s string
+			if json.Unmarshal(sid, &s) == nil && s != "" {
+				sessionID = s
+				break
+			}
+		}
+	}
+
+	var eventType string
+	if json.Unmarshal(raw["type"], &eventType) != nil {
+		return
+	}
+
+	switch eventType {
+	case "text", "tool_use":
+		isWork = true
+	case "step_finish":
+		var part struct {
+			Reason string `json:"reason"`
+		}
+		if json.Unmarshal(raw["part"], &part) == nil {
+			stepReason = part.Reason
+		}
+	}
+	return
 }
 
 // writeOpenCodeConfig writes opencode configuration files to workDir.
@@ -119,21 +178,114 @@ func (e *Executor) runOpenCodeAgent(ctx context.Context, workDir, prompt, analys
 
 // runOpenCodeProcess is the shared implementation used by both the local
 // Executor and the K8s worker (via runWorkerOpenCode in worker.go).
+//
+// It writes the opencode config once, then supervises one or more invocations
+// of the opencode CLI. When a run ends with step_finish reason="length" the
+// agent's context-window was exhausted mid-task; runOpenCodeProcess resumes
+// the same session by re-invoking opencode with --session <sessionID> and a
+// continuation prompt, up to maxContinuations times.
 func runOpenCodeProcess(ctx context.Context, binary, workDir, prompt, analysisID, baseURL, apiKey, model string, hub outputBroadcaster) error {
 	if err := writeOpenCodeConfig(workDir, baseURL, apiKey, model); err != nil {
 		return fmt.Errorf("write opencode config: %w", err)
 	}
 
-	// Write prompt to file (for audit) and feed via stdin so it never
-	// appears in /proc/*/cmdline.
-	promptFile := filepath.Join(workDir, "prompt.txt")
-	if err := os.WriteFile(promptFile, []byte(prompt), 0640); err != nil {
+	// Write the initial prompt to a file for auditing purposes.
+	if err := os.WriteFile(filepath.Join(workDir, "prompt.txt"), []byte(prompt), 0640); err != nil {
 		return fmt.Errorf("write prompt file: %w", err)
 	}
 
+	log.Info().
+		Str("binary", binary).
+		Str("work_dir", workDir).
+		Str("model", model).
+		Str("analysis_id", analysisID).
+		Msg("Starting opencode agent")
+
+	currentPrompt := prompt
+	sessionID := ""
+
+	for attempt := 0; attempt <= maxContinuations; attempt++ {
+		if attempt > 0 {
+			currentPrompt = BuildContinuationPrompt()
+
+			// Save continuation prompt for audit.
+			contFile := filepath.Join(workDir, fmt.Sprintf("prompt_continuation_%d.txt", attempt))
+			if err := os.WriteFile(contFile, []byte(currentPrompt), 0640); err != nil {
+				log.Warn().Err(err).Str("file", contFile).Msg("Failed to write continuation prompt file")
+			}
+
+			log.Info().
+				Int("attempt", attempt).
+				Int("max_continuations", maxContinuations).
+				Str("session_id", sessionID).
+				Str("analysis_id", analysisID).
+				Msg("Continuing opencode session after length-limited step")
+
+			hub.Broadcast(analysisID, []byte(fmt.Sprintf(
+				"[continuation] Resuming session (attempt %d/%d, session: %s)",
+				attempt, maxContinuations, sessionID,
+			)))
+		}
+
+		result, err := runOpenCodeOnce(ctx, binary, workDir, currentPrompt, analysisID, sessionID, baseURL, apiKey, model, hub)
+		if err != nil {
+			return err
+		}
+
+		// Keep the most-recently observed session ID for potential continuation.
+		if result.SessionID != "" {
+			sessionID = result.SessionID
+		}
+
+		// Any finish reason other than "length" means the agent stopped
+		// voluntarily — treat that as successful completion of this phase.
+		if result.StepReason != "length" {
+			log.Info().
+				Str("step_reason", result.StepReason).
+				Int("continuations", attempt).
+				Str("analysis_id", analysisID).
+				Msg("opencode agent completed")
+			return nil
+		}
+
+		// The step was truncated due to context-window exhaustion.
+		if sessionID == "" {
+			return fmt.Errorf("opencode step finished with reason=length but no session ID was captured; cannot continue")
+		}
+
+		// If the run produced no useful work (no text or tool_use events)
+		// while the context window was also exhausted, there is nothing to
+		// build on — continuing would likely just repeat the same empty run.
+		if !result.HasWork {
+			return fmt.Errorf("opencode run (attempt %d) finished with reason=length but produced no useful output; aborting", attempt)
+		}
+
+		if attempt == maxContinuations {
+			log.Warn().
+				Int("max_continuations", maxContinuations).
+				Str("session_id", sessionID).
+				Str("analysis_id", analysisID).
+				Msg("Reached maximum continuation limit for opencode session")
+			return fmt.Errorf("opencode session reached the maximum continuation limit (%d) with step reason=length", maxContinuations)
+		}
+	}
+
+	return nil
+}
+
+// runOpenCodeOnce launches a single opencode invocation and returns the
+// aggregated metadata from its JSON event stream together with any process
+// error.
+//
+// If sessionID is non-empty, --session <sessionID> is appended to the args so
+// that opencode resumes an existing session instead of creating a new one.
+func runOpenCodeOnce(ctx context.Context, binary, workDir, prompt, analysisID, sessionID, baseURL, apiKey, model string, hub outputBroadcaster) (openCodeRunResult, error) {
 	args := []string{"run", "--format", "json"}
 	if model != "" {
 		args = append(args, "--model", "custom/"+model)
+	}
+	if sessionID != "" {
+		args = append(args, "--session", sessionID)
 	}
 
 	cmd := exec.CommandContext(ctx, binary, args...)
@@ -152,13 +304,13 @@ func runOpenCodeProcess(ctx context.Context, binary, workDir, prompt, analysisID
 
 	stdoutFile, err := os.OpenFile(filepath.Join(workDir, "output", "agent_stdout.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
 	if err != nil {
-		return fmt.Errorf("create stdout log: %w", err)
+		return openCodeRunResult{}, fmt.Errorf("create stdout log: %w", err)
 	}
 	defer func() { _ = stdoutFile.Close() }()
 
 	stderrFile, err := os.OpenFile(filepath.Join(workDir, "output", "agent_stderr.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
 	if err != nil {
-		return fmt.Errorf("create stderr log: %w", err)
+		return openCodeRunResult{}, fmt.Errorf("create stderr log: %w", err)
 	}
 	defer func() { _ = stderrFile.Close() }()
 
@@ -167,7 +319,10 @@ func runOpenCodeProcess(ctx context.Context, binary, workDir, prompt, analysisID
 	cmd.Stdout = io.MultiWriter(stdoutFile, stdoutPW)
 	cmd.Stderr = io.MultiWriter(stderrFile, stderrPW)
 
-	var wg sync.WaitGroup
+	var (
+		result openCodeRunResult
+		wg     sync.WaitGroup
+	)
 
 	broadcast := func(msg string) {
 		hub.Broadcast(analysisID, []byte(msg))
@@ -180,6 +335,20 @@ func runOpenCodeProcess(ctx context.Context, binary, workDir, prompt, analysisID
 		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
 		for scanner.Scan() {
 			raw := scanner.Bytes()
+
+			// Extract machine-readable metadata before anything else.
+			sid, reason, isWork := parseOpenCodeEventMeta(raw)
+			if sid != "" {
+				result.SessionID = sid
+			}
+			if reason != "" {
+				result.StepReason = reason
+			}
+			if isWork {
+				result.HasWork = true
+			}
+
+			// Broadcast human-readable message to connected WebSocket clients.
 			msg := extractOpenCodeMessage(raw)
 			if msg != "" {
 				broadcast(msg)
@@ -205,8 +374,9 @@ func runOpenCodeProcess(ctx context.Context, binary, workDir, prompt, analysisID
 	log.Info().
 		Str("binary", binary).
 		Str("work_dir", workDir).
+		Str("session_id", sessionID).
 		Str("model", model).
-		Msg("Starting opencode agent process")
+		Msg("Starting opencode run")
 
 	startTime := time.Now()
 	err = cmd.Run()
@@ -216,11 +386,14 @@ func runOpenCodeProcess(ctx context.Context, binary, workDir, prompt, analysisID
 
 	log.Info().
 		Str("work_dir", workDir).
+		Str("session_id", result.SessionID).
+		Str("step_reason", result.StepReason).
+		Bool("has_work", result.HasWork).
 		Dur("duration", time.Since(startTime)).
 		Err(err).
-		Msg("opencode agent process finished")
+		Msg("opencode run finished")
 
-	return err
+	return result, err
 }
 
 // extractOpenCodeMessage parses a JSON event line from opencode --format json

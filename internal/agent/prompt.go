@@ -197,7 +197,38 @@ func BuildPrompt(pkg *models.SoftwarePackage, phase string, analysisPrompt strin
 	}
 }
 
-// BuildMultiPackagePrompt builds a prompt for analyzing multiple packages at once.
+// BuildContinuationPrompt returns a prompt that instructs the security analyst
+// to continue a truncated analysis session from where it left off.
+//
+// It is used by runOpenCodeProcess when an opencode invocation finishes with
+// step_finish reason="length", meaning the model's output was cut short by the
+// context-window limit before the analysis was complete. The continuation run
+// resumes the same opencode session (via --session <sessionID>) so the agent
+// can pick up where it stopped.
+//
+// The prompt assumes the following output files may already be partially
+// written by the preceding run and should be updated in place:
+//   - output/results.sarif
+//   - output/report.md
+//   - output/notes.md
+func BuildContinuationPrompt() string {
+	return `Continue the security analysis from where you left off.
+
+## Instructions
+
+- Do NOT restart the scan or re-clone any repositories.
+- Do NOT repeat findings that have already been written to output/results.sarif or output/report.md.
+- Focus on the remaining unreviewed files and attack surfaces that were not yet covered.
+- Update output/results.sarif and output/report.md IN PLACE, appending only newly discovered findings.
+- Update output/notes.md with any new observations.
+- If you have already completed all phases of the analysis, write a short completion summary to output/notes.md and stop.
+
+## Reminder
+
+Your previous run was cut short because the output reached the context length limit.
+Pick up exactly where you stopped. Do not re-introduce already-reported findings.
+Report only newly discovered vulnerabilities and any final completion details.`
+}
 func BuildMultiPackagePrompt(packages []models.SoftwarePackage, analysisPrompt string, analysisCtx *models.AnalysisContext, preClonedByPackage map[string]string) string {
 	var sb strings.Builder
 	sb.WriteString("You are a security analyst performing a comprehensive vulnerability assessment.\n\n")
